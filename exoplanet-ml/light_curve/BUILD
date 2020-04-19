@@ -21,17 +21,17 @@ py_test(
 )
 
 py_library(
-    name = "median_filter",
-    srcs = ["median_filter.py"],
+    name = "binning",
+    srcs = ["binning.py"],
     srcs_version = "PY2AND3",
 )
 
 py_test(
-    name = "median_filter_test",
+    name = "binning_test",
     size = "small",
-    srcs = ["median_filter_test.py"],
+    srcs = ["binning_test.py"],
     srcs_version = "PY2AND3",
-    deps = [":median_filter"],
+    deps = [":binning"],
 )
 
 py_library(
@@ -63,4 +63,16 @@ py_test(
         ":periodic_event",
         ":util",
     ],
+)
+
+proto_library(
+    name = "light_curve_pb2",
+    srcs = ["light_curve.proto"],
+    cc_api_version = 2,
+)
+
+py_proto_library(
+    name = "light_curve_py_pb2",
+    api_version = 2,
+    deps = [":light_curve_pb2"],
 )

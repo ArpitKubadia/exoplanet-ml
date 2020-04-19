@@ -178,27 +178,43 @@ def build_dataset(file_pattern,
   if include_labels:
     # Ensure that the label ids are contiguous integers starting at 0.
     label_ids = set(input_config.label_map.values())
+    if -1 in label_ids:
+      # The special ID -1 marks labels that will be removed.
+      label_ids.remove(-1)
     if label_ids != set(range(len(label_ids))):
       raise ValueError(
           "Label IDs must be contiguous integers starting at 0. Got: {}".format(
               label_ids))
 
-    # Create a HashTable mapping label strings to integer ids.
+    # Create a HashTable mapping label strings to integer ids. Lookup failures
+    # will return -2.
     table_initializer = tf.contrib.lookup.KeyValueTensorInitializer(
         keys=list(input_config.label_map.keys()),
         values=list(input_config.label_map.values()),
         key_dtype=tf.string,
         value_dtype=tf.int32)
     label_to_id = tf.contrib.lookup.HashTable(
-        table_initializer, default_value=-1)
+        table_initializer, default_value=-2)
 
   def _example_parser(serialized_example):
     """Parses a single tf.Example into feature and label tensors."""
     # Set specifications for parsing the features.
-    data_fields = {
-        feature_name: tf.FixedLenFeature([feature.length], tf.float32)
-        for feature_name, feature in input_config.features.items()
-    }
+    data_fields = {}
+    for feature_name, feature in input_config.features.items():
+      feature_spec = tf.FixedLenFeature([feature.length], tf.float32)
+      if feature.is_time_series and feature.get("subcomponents"):
+        for subcomponent in feature.subcomponents:
+          if subcomponent["ndims"] > 1:
+            # Time series features with multiple dimensions are encoded as
+            # separate single-dimensional features 'name_0', 'name_1', ...
+            for i in range(subcomponent["ndims"]):
+              field_name = "{}_{}".format(subcomponent["name"], i)
+              data_fields[field_name] = feature_spec
+          else:
+            data_fields[subcomponent["name"]] = feature_spec
+      else:
+        data_fields[feature_name] = feature_spec
+
     if include_labels:
       data_fields[input_config.label_feature] = tf.FixedLenFeature([],
                                                                    tf.string)
@@ -217,20 +233,22 @@ def build_dataset(file_pattern,
 
     # Reorganize outputs.
     output = {}
-    for feature_name, value in parsed_features.items():
-      if include_labels and feature_name == input_config.label_feature:
-        label_id = label_to_id.lookup(value)
-        # Ensure that the label_id is nonnegative to verify a successful hash
-        # map lookup.
-        assert_known_label = tf.Assert(
-            tf.greater_equal(label_id, tf.to_int32(0)),
-            ["Unknown label string:", value])
-        with tf.control_dependencies([assert_known_label]):
-          label_id = tf.identity(label_id)
+    for feature_name, feature in input_config.features.items():
+      if feature.is_time_series:
+        if feature.get("subcomponents"):
+          values = []
+          for subcomponent in feature.subcomponents:
+            if subcomponent["ndims"] > 1:
+              for i in range(subcomponent["ndims"]):
+                field_name = "{}_{}".format(subcomponent["name"], i)
+                values.append(parsed_features.pop(field_name))
+            else:
+              values.append(parsed_features.pop(subcomponent["name"]))
+          value = tf.stack(values, axis=1)
+        else:
+          # Reshape [length] -> [length, 1].
+          value = tf.expand_dims(parsed_features.pop(feature_name), 1)
 
-        # We use the plural name "labels" in the output due to batching.
-        output["labels"] = label_id
-      elif input_config.features[feature_name].is_time_series:
         # Possibly reverse.
         if reverse_time_series_prob > 0:
           # pylint:disable=cell-var-from-loop
@@ -243,7 +261,24 @@ def build_dataset(file_pattern,
       else:
         if "aux_features" not in output:
           output["aux_features"] = {}
-        output["aux_features"][feature_name] = value
+        output["aux_features"][feature_name] = parsed_features.pop(feature_name)
+
+    if include_labels:
+      label_value = parsed_features.pop(input_config.label_feature)
+      label_id = label_to_id.lookup(label_value)
+      # Assert the label is recognized. -1 is allowed; these will be filtered
+      # later.
+      is_known_label = tf.greater_equal(label_id, tf.constant(-1, tf.int32))
+      assert_known_label = tf.Assert(is_known_label,
+                                     ["Unknown label string:", label_value])
+      with tf.control_dependencies([assert_known_label]):
+        label_id = tf.identity(label_id)
+
+      # We use the plural name "labels" in the output due to batching.
+      output["labels"] = label_id
+
+    # Sanity check: should have popped all parsed features by this point.
+    assert not parsed_features
 
     return output
 
@@ -252,8 +287,11 @@ def build_dataset(file_pattern,
   if len(filenames) > 1 and shuffle_filenames:
     filename_dataset = filename_dataset.shuffle(len(filenames))
 
-  # Read serialized Example protos.
-  dataset = filename_dataset.flat_map(tf.data.TFRecordDataset)
+  # Read serialized Example protos in parallel. cycle_length is the number of
+  # files to read in parallel, and block_length is the number of items to pull
+  # from each file at a time.
+  dataset = filename_dataset.interleave(
+      tf.data.TFRecordDataset, cycle_length=8, block_length=8)
 
   # Possibly shuffle. Note that we shuffle before repeat(), so we only shuffle
   # elements among each "epoch" of data, and not across epochs of data.
@@ -265,7 +303,15 @@ def build_dataset(file_pattern,
     dataset = dataset.repeat(repeat)
 
   # Map the parser over the dataset.
-  dataset = dataset.map(_example_parser, num_parallel_calls=4)
+  dataset = dataset.map(_example_parser, num_parallel_calls=8)
+
+  if include_labels and -1 in input_config.label_map.values():
+    # Filter out examples with label -1 (we already asserted that all labels are
+    # at least -1, so we can simply filter out the negative labels).
+    def include_example(inputs):
+      return tf.greater_equal(inputs["labels"], tf.constant(0, tf.int32))
+
+    dataset = dataset.filter(include_example).prefetch(1024)
 
   # Batch results by up to batch_size.
   dataset = dataset.batch(batch_size)

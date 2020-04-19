@@ -60,6 +60,8 @@ class AstrowavenetTest(tf.test.TestCase):
     }
     mode = tf.estimator.ModeKeys.TRAIN
     hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
         "dilation_kernel_width": 2,
         "skip_output_dim": 6,
         "preprocess_output_size": 3,
@@ -69,6 +71,7 @@ class AstrowavenetTest(tf.test.TestCase):
         "output_distribution": {
             "type": "normal",
             "min_scale": 0.001,
+            "predict_outlier_distribution": False
         }
     })
 
@@ -193,11 +196,11 @@ class AstrowavenetTest(tf.test.TestCase):
       batch_size = 11
       feed_dict = {
           input_placeholder:
-              np.random.random((batch_size, time_series_length,
-                                input_num_features)),
+              np.random.random(
+                  (batch_size, time_series_length, input_num_features)),
           context_placeholder:
-              np.random.random((batch_size, time_series_length,
-                                context_num_features))
+              np.random.random(
+                  (batch_size, time_series_length, context_num_features))
       }
       batch_losses, per_example_loss, total_loss = sess.run(
           [model.batch_losses, model.per_example_loss, model.total_loss],
@@ -226,6 +229,8 @@ class AstrowavenetTest(tf.test.TestCase):
     }
     mode = tf.estimator.ModeKeys.TRAIN
     hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
         "dilation_kernel_width": 2,
         "skip_output_dim": 6,
         "preprocess_output_size": 3,
@@ -265,11 +270,11 @@ class AstrowavenetTest(tf.test.TestCase):
       batch_size = 11
       feed_dict = {
           input_placeholder:
-              np.random.random((batch_size, time_series_length,
-                                input_num_features)),
+              np.random.random(
+                  (batch_size, time_series_length, input_num_features)),
           context_placeholder:
-              np.random.random((batch_size, time_series_length,
-                                context_num_features))
+              np.random.random(
+                  (batch_size, time_series_length, context_num_features))
       }
       batch_losses, per_example_loss, total_loss = sess.run(
           [model.batch_losses, model.per_example_loss, model.total_loss],
@@ -298,6 +303,8 @@ class AstrowavenetTest(tf.test.TestCase):
     }
     mode = tf.estimator.ModeKeys.TRAIN
     hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
         "dilation_kernel_width": 2,
         "skip_output_dim": 6,
         "preprocess_output_size": 3,
@@ -307,6 +314,7 @@ class AstrowavenetTest(tf.test.TestCase):
         "output_distribution": {
             "type": "normal",
             "min_scale": 0,
+            "predict_outlier_distribution": False
         }
     })
 
@@ -360,6 +368,140 @@ class AstrowavenetTest(tf.test.TestCase):
       np.testing.assert_almost_equal(2, num_examples)
       np.testing.assert_almost_equal(5.96392435, total_loss)
 
+  def test_output_normal_mixture(self):
+    time_series_length = 6
+    input_num_features = 2
+    context_num_features = 7
+
+    input_placeholder = tf.placeholder(
+        dtype=tf.float32,
+        shape=[None, time_series_length, input_num_features],
+        name="input")
+    context_placeholder = tf.placeholder(
+        dtype=tf.float32,
+        shape=[None, time_series_length, context_num_features],
+        name="context")
+    features = {
+        "autoregressive_input": input_placeholder,
+        "conditioning_stack": context_placeholder
+    }
+    mode = tf.estimator.ModeKeys.TRAIN
+    hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
+        "dilation_kernel_width": 2,
+        "skip_output_dim": 6,
+        "preprocess_output_size": 3,
+        "preprocess_kernel_width": 5,
+        "num_residual_blocks": 2,
+        "dilation_rates": [1, 2, 4],
+        "output_distribution": {
+            "type": "normal",
+            "min_scale": 0,
+            "predict_outlier_distribution": True
+        }
+    })
+
+    model = astrowavenet_model.AstroWaveNet(features, hparams, mode)
+    model.build()
+
+    # Model predicts the loc and scale of the outlier and non-outlier Gaussian
+    # distributions, and the probability of being an outlier.
+    self.assertItemsEqual(
+        ["loc", "scale", "outlier_prob", "outlier_loc", "outlier_scale"],
+        model.dist_params.keys())
+    self.assertShapeEquals((None, time_series_length, input_num_features),
+                           model.dist_params["loc"])
+    self.assertShapeEquals((None, time_series_length, input_num_features),
+                           model.dist_params["scale"])
+    self.assertShapeEquals((2,), model.dist_params["outlier_prob"])
+    self.assertShapeEquals((2,), model.dist_params["outlier_loc"])
+    self.assertShapeEquals((2,), model.dist_params["outlier_scale"])
+
+    scaffold = tf.train.Scaffold()
+    scaffold.finalize()
+    with self.cached_session() as sess:
+      sess.run([scaffold.init_op, scaffold.local_init_op])
+      step = sess.run(model.global_step)
+      self.assertEqual(0, step)
+
+      feed_dict = {
+          input_placeholder: [
+              [[1, 9], [1, 9], [1, 9], [1, 9], [1, 9], [1, 9]],
+              [[2, 8], [2, 8], [2, 8], [2, 8], [2, 8], [2, 8]],
+          ],
+          # Context is not needed since we explicitly feed the dist params.
+          model.dist_params["loc"]: [
+              [[1, 8], [1, 8], [1, 8], [1, 8], [1, 8], [1, 8]],
+              [[2, 9], [2, 9], [2, 9], [2, 9], [2, 9], [2, 9]],
+          ],
+          model.dist_params["scale"]: [
+              [[0.1, 0.1], [0.2, 0.2], [0.5, 0.5], [1, 1], [2, 2], [5, 5]],
+              [[0.1, 0.1], [0.2, 0.2], [0.5, 0.5], [1, 1], [2, 2], [5, 5]],
+          ],
+          model.dist_params["outlier_prob"]: [0, 0],
+          model.dist_params["outlier_loc"]: [1, 8],
+          model.dist_params["outlier_scale"]: [1, 0.1],
+      }
+      batch_losses, per_example_loss, num_examples, total_loss = sess.run(
+          [
+              model.batch_losses, model.per_example_loss,
+              model.num_nonzero_weight_examples, model.total_loss
+          ],
+          feed_dict=feed_dict)
+
+      # Outlier probability is 0.0, so predictions are from the non-outlier
+      # distribution.
+      np.testing.assert_array_almost_equal(
+          [[[-1.38364656, 48.61635344], [-0.69049938, 11.80950062],
+            [0.22579135, 2.22579135], [0.91893853, 1.41893853],
+            [1.61208571, 1.73708571], [2.52837645, 2.54837645]],
+           [[-1.38364656, 48.61635344], [-0.69049938, 11.80950062],
+            [0.22579135, 2.22579135], [0.91893853, 1.41893853],
+            [1.61208571, 1.73708571], [2.52837645, 2.54837645]]], batch_losses)
+      np.testing.assert_array_almost_equal([5.96392435, 5.96392435],
+                                           per_example_loss)
+      np.testing.assert_almost_equal(2, num_examples)
+      np.testing.assert_almost_equal(5.96392435, total_loss)
+
+      # Outlier probability is 1.0, so predictions are from the outlier
+      # distribution.
+      feed_dict[model.dist_params["outlier_prob"]] = [1, 1]
+      batch_losses, per_example_loss, num_examples, total_loss = sess.run(
+          [
+              model.batch_losses, model.per_example_loss,
+              model.num_nonzero_weight_examples, model.total_loss
+          ],
+          feed_dict=feed_dict)
+      np.testing.assert_array_almost_equal(
+          [[[0.918939, 48.616352]] * 6, [[1.418939, -1.383647]] * 6],
+          batch_losses)
+      np.testing.assert_array_almost_equal([24.7676468, 0.017645916],
+                                           per_example_loss, 5)
+      np.testing.assert_almost_equal(2, num_examples)
+      np.testing.assert_almost_equal(12.392646358, total_loss, decimal=6)
+
+      # Predictions are weighted from the non-outlier and outlier distributions.
+      feed_dict[model.dist_params["outlier_prob"]] = [0.3, 0.5]
+      batch_losses, per_example_loss, num_examples, total_loss = sess.run(
+          [
+              model.batch_losses, model.per_example_loss,
+              model.num_nonzero_weight_examples, model.total_loss
+          ],
+          feed_dict=feed_dict)
+      np.testing.assert_array_almost_equal(
+          [[[-1.06893575, 48.61635208], [-0.41606259, 12.5026474],
+            [0.38831028, 2.91893864], [0.91893858, 2.11208582],
+            [1.34972155, 2.430233], [1.73991919, 3.24152374]],
+           [[-1.05263364, -0.69049942], [-0.38450652, -0.69050133],
+            [0.46027452, -0.71720666], [1.04454803, -0.74938428],
+            [1.55012715, -0.73367846], [2.05226898, -0.70991373]]],
+          batch_losses)
+      np.testing.assert_array_almost_equal([6.227806, -0.051759],
+                                           per_example_loss)
+      np.testing.assert_almost_equal(2, num_examples)
+      np.testing.assert_almost_equal(3.0880234, total_loss, decimal=6)
+
   def test_output_categorical(self):
     time_series_length = 3
     input_num_features = 1
@@ -380,6 +522,8 @@ class AstrowavenetTest(tf.test.TestCase):
     }
     mode = tf.estimator.ModeKeys.TRAIN
     hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
         "dilation_kernel_width": 2,
         "skip_output_dim": 6,
         "preprocess_output_size": 3,
@@ -487,6 +631,8 @@ class AstrowavenetTest(tf.test.TestCase):
     }
     mode = tf.estimator.ModeKeys.TRAIN
     hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
         "dilation_kernel_width": 2,
         "skip_output_dim": 6,
         "preprocess_output_size": 3,
@@ -496,6 +642,7 @@ class AstrowavenetTest(tf.test.TestCase):
         "output_distribution": {
             "type": "normal",
             "min_scale": 0,
+            "predict_outlier_distribution": False
         }
     })
 
@@ -550,7 +697,7 @@ class AstrowavenetTest(tf.test.TestCase):
       np.testing.assert_almost_equal(2, num_examples)
       np.testing.assert_almost_equal(4.07788801, total_loss)
 
-  def test_causality(self):
+  def test_causality_without_future_context(self):
     time_series_length = 7
     input_num_features = 1
     context_num_features = 1
@@ -569,6 +716,8 @@ class AstrowavenetTest(tf.test.TestCase):
     }
     mode = tf.estimator.ModeKeys.TRAIN
     hparams = configdict.ConfigDict({
+        "use_future_context": False,
+        "predict_n_steps_ahead": 1,
         "dilation_kernel_width": 1,
         "skip_output_dim": 1,
         "preprocess_output_size": 1,
@@ -578,6 +727,86 @@ class AstrowavenetTest(tf.test.TestCase):
         "output_distribution": {
             "type": "normal",
             "min_scale": 0.001,
+            "predict_outlier_distribution": False
+        }
+    })
+
+    model = astrowavenet_model.AstroWaveNet(features, hparams, mode)
+    model.build()
+
+    scaffold = tf.train.Scaffold()
+    scaffold.finalize()
+    with self.cached_session() as sess:
+      sess.run([scaffold.init_op, scaffold.local_init_op])
+      step = sess.run(model.global_step)
+      self.assertEqual(0, step)
+
+      feed_dict = {
+          input_placeholder: [
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[1], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [1], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [1]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+          ],
+          context_placeholder: [
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+              [[1], [0], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [1], [0], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [1]],
+          ],
+      }
+      network_output = sess.run(model.network_output, feed_dict=feed_dict)
+      np.testing.assert_array_equal(
+          [
+              [[0], [0], [0], [0], [0], [0], [0]],
+              # Input elements are used to predict the next timestamp.
+              [[0], [1], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [1], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+              # Context elements are used to predict the next timestamp.
+              [[0], [1], [0], [0], [0], [0], [0]],
+              [[0], [0], [0], [0], [1], [0], [0]],
+              [[0], [0], [0], [0], [0], [0], [0]],
+          ],
+          np.greater(np.abs(network_output), 0))
+
+  def test_causality_with_future_context(self):
+    time_series_length = 7
+    input_num_features = 1
+    context_num_features = 1
+
+    input_placeholder = tf.placeholder(
+        dtype=tf.float32,
+        shape=[None, time_series_length, input_num_features],
+        name="input")
+    context_placeholder = tf.placeholder(
+        dtype=tf.float32,
+        shape=[None, time_series_length, context_num_features],
+        name="context")
+    features = {
+        "autoregressive_input": input_placeholder,
+        "conditioning_stack": context_placeholder
+    }
+    mode = tf.estimator.ModeKeys.TRAIN
+    hparams = configdict.ConfigDict({
+        "use_future_context": True,
+        "predict_n_steps_ahead": 1,
+        "dilation_kernel_width": 1,
+        "skip_output_dim": 1,
+        "preprocess_output_size": 1,
+        "preprocess_kernel_width": 1,
+        "num_residual_blocks": 1,
+        "dilation_rates": [1],
+        "output_distribution": {
+            "type": "normal",
+            "min_scale": 0.001,
+            "predict_outlier_distribution": False
         }
     })
 

@@ -34,13 +34,15 @@ def base():
               "global_view": {
                   "length": 2001,
                   "is_time_series": True,
+                  "subcomponents": [],
               },
           },
 
           # Name of the feature containing training labels.
           "label_feature": "av_training_set",
 
-          # Label string to integer id.
+          # Label string to integer id. Use -1 to ignore examples with that
+          # label.
           "label_map": {
               "PC": 1,  # Planet Candidate.
               "AFP": 0,  # Astrophysical False Positive.
@@ -48,6 +50,7 @@ def base():
               "SCR1": 0,  # TCE from scrambled light curve with SCR1 order.
               "INV": 0,  # TCE from inverted light curve.
               "INJ1": 1,  # Injected Planet.
+              "INJ2": 0,  # Simulated eclipsing binary.
           },
       },
       # Hyperparameters for building and training the model.
@@ -68,8 +71,14 @@ def base():
           # Learning rate parameters.
           "learning_rate": 2e-4,
           "learning_rate_decay_steps": 0,
-          "learning_rate_decay_factor": 0,
-          "learning_rate_decay_staircase": True,
+          "learning_rate_end_factor": 0.0,
+          "learning_rate_decay_power": 1.0,
+
+          # Weight decay regularization.
+          "weight_decay": 0.0,
+
+          # Label smoothing regularization.
+          "label_smoothing": 0.0,
 
           # Optimizer for training the model.
           "optimizer": "adam",

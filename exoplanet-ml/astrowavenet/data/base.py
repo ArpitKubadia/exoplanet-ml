@@ -90,6 +90,7 @@ class _ShardedDatasetBuilder(DatasetBuilder):
         "shuffle_values_buffer": 1000,
         "num_parallel_parser_calls": 4,
         "batches_buffer_size": None,  # Defaults to max(1, 256 / batch_size).
+        "excluded_examples": [],
     })
     return config
 
@@ -113,12 +114,16 @@ class _ShardedDatasetBuilder(DatasetBuilder):
       # "weights" Tensor with zeros as well, which ensures that padded elements
       # do not contribute to the loss.
       padded_shapes = {}
-      for name, shape in dataset.output_shapes.iteritems():
-        shape.assert_is_compatible_with([None, None])  # Expect a 2D sequence.
-        dims = shape.as_list()
-        dims[0] = padded_length
-        shape = tf.TensorShape(dims)
-        shape.assert_is_fully_defined()
+      for name, shape in dataset.output_shapes.items():
+        if shape.rank == 2:
+          dims = shape.as_list()
+          dims[0] = padded_length
+          shape = tf.TensorShape(dims)
+          shape.assert_is_fully_defined()
+        elif shape.rank != 0:
+          raise ValueError(
+              "Expected all features to be scalars or 2D sequences. Got {} "
+              "with shape {}".format(name, shape))
         padded_shapes[name] = shape
     else:
       # Pad each batch up to the maximum size of each dimension in the batch.
@@ -173,11 +178,21 @@ class _ShardedDatasetBuilder(DatasetBuilder):
         self.create_example_parser(),
         num_parallel_calls=self.config.num_parallel_parser_calls)
 
+    # Filter the dataset.
+    if self.config.excluded_examples:
+
+      def include_example(example):
+        example_is_excluded = tf.reduce_any(
+            tf.equal(example["example_id"], self.config.excluded_examples))
+        return tf.math.logical_not(example_is_excluded)
+
+      dataset = dataset.filter(include_example)
+
     def _prepare_wavenet_inputs(features):
       """Validates features, and clips lengths and adds weights if needed."""
       # Validate feature names.
       required_features = {"autoregressive_input", "conditioning_stack"}
-      allowed_features = required_features | {"weights"}
+      allowed_features = required_features | {"weights", "example_id", "time"}
       feature_names = features.keys()
       if not required_features.issubset(feature_names):
         raise ValueError("Features must contain all of: {}. Got: {}".format(
@@ -188,17 +203,24 @@ class _ShardedDatasetBuilder(DatasetBuilder):
 
       output = {}
       for name, value in features.items():
-        # Validate shapes. The output dimension is [num_samples, dim].
-        ndims = len(value.shape)
-        if ndims == 1:
-          # Add an extra dimension: [num_samples] -> [num_samples, 1].
-          value = tf.expand_dims(value, -1)
-        elif ndims != 2:
-          raise ValueError(
-              "Features should be 1D or 2D sequences. Got '{}' = {}".format(
-                  name, value))
-        if self.config.max_length:
-          value = value[:self.config.max_length]
+        # Validate shapes.
+        ndims = value.shape.rank
+        if name == "example_id":
+          if ndims != 0:
+            raise ValueError(
+                "example_id should be a scalar. Got {}".format(value))
+        # All features should have shape [num_samples, dim].
+        else:
+          if ndims == 1:
+            # Add an extra dimension: [num_samples] -> [num_samples, 1].
+            value = tf.expand_dims(value, -1)
+          elif ndims != 2:
+            raise ValueError(
+                "Features should be 1D or 2D sequences. Got '{}' = {}".format(
+                    name, value))
+          # Possibly clip the sequence length.
+          if self.config.max_length:
+            value = value[:self.config.max_length]
         output[name] = value
 
       if "weights" not in output:
